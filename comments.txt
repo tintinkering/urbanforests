@@ -121,5 +121,6 @@ rows = Parallel(n_jobs=min(4, len(PLACES)))(delayed(run_one)(p) for p in PLACES)
 pd.DataFrame(rows).to_csv("outputs_multi/city_metrics.csv", index=False)
 print("Wrote outputs_multi/city_metrics.csv")
 
+more sources: https://onlinelibrary.wiley.com/doi/full/10.1002/gch2.202200158
   
 
