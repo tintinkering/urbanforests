@@ -1,0 +1,126 @@
+1) Downloads OpenStreetMap for a city 
+2) Extracts "green" polygons (parks/trees/grass/etc.)
+3) Build spatial graph - each green polygon is a node, each edge a potential ecological corridor (lower weight if overlapping with streets) 
+4) Computes algebraic connectivity, clustering, path length, 'small worldness', global efficiency 
+5) Runs resiliency simulations by removing nodes, exporting geospatial layers 
+6) Figures to summarize the entwork 
+  
+
+      """
+    Small container for tunable parameters used across the pipeline.
+
+    Attributes
+    ----------
+    place : str
+        Place name query for OSMnx (used to geocode boundary & fetch data)
+    out_dir : str
+        Directory where all outputs (gpkg, plots, csv) are written
+    crs_projected : str
+        Projected CRS used for distance/area ops (autodetected later)
+    patch_min_area_m2 : float
+        Minimum polygon area (m²) to keep as a "green patch"
+    street_buffer_m : float
+        Buffer (meters) around streets to discount corridor costs when overlapped
+    edge_cost_tau : float
+        Decay constant controlling how edge weights decrease with effective cost
+    connect_dist_m : float
+        Base neighborhood distance (meters) to consider patch–patch connections
+    grid_side_m : float
+        Grid side for optional gridding (not used downstream here)
+    random_seed : int
+        Seed for reproducible random operations
+    """
+
+  # The block below explores which new edges would most increase λ₂ on a small node sample
+
+# def lambda2_after_adding_edge(G: nx.Graph, u, v, weight: float = 1.0) -> float:
+#     """Helper to compute λ₂ after hypothetically adding an edge (u,v)."""
+#     G2 = G.copy()
+#     G2.add_edge(u, v, weight=weight)
+#     lam2, _ = algebraic_connectivity_and_fiedler(G2)
+#     return lam2
+#
+# sample_nodes = list(G.nodes())[:50]
+# best = []
+# for i, u in enumerate(sample_nodes):
+#     for v in sample_nodes[i+1:]:
+#         if not G.has_edge(u, v):
+#             try:
+#                 gain = lambda2_after_adding_edge(G, u, v, weight=1.0) - metrics["lambda2"]
+#                 best.append((gain, u, v))
+#             except Exception:
+#                 pass
+# best = sorted(best, reverse=True)[:10]
+# pd.DataFrame(best, columns=["lambda2_gain", "u", "v"])
+
+
+  def build_city_green_network(place: str, cfg_overrides: dict | None = None):
+    local_cfg = Config(**{**cfg.__dict__, **(cfg_overrides or {})})
+    boundary = download_city_boundary(place)
+    local_cfg.crs_projected = to_utm_crs(boundary)
+    streets = download_streets(place, network_type="drive")
+    greens = download_green_polygons(place)
+    patches = dissolve_and_clean_green(greens, local_cfg, boundary)
+    G, node_df = build_green_graph(patches, streets, local_cfg)
+    metrics = compute_smallworld_and_spectral(G)
+
+    nodes_points = gpd.GeoDataFrame(
+        node_df[["patch_id", "area_m2"]].copy(),
+        geometry=[Point(xy) for xy in zip(node_df["centroid_x"], node_df["centroid_y"])],
+        crs=patches.crs
+    )
+    edges_rows = []
+    for u, v, data in G.edges(data=True):
+        p1 = nodes_points.loc[nodes_points["patch_id"] == u].geometry.values[0]
+        p2 = nodes_points.loc[nodes_points["patch_id"] == v].geometry.values[0]
+        edges_rows.append({"u": u, "v": v, "weight": data.get("weight", 1.0), "geometry": LineString([p1, p2])})
+    edges_gdf = gpd.GeoDataFrame(edges_rows, crs=patches.crs)
+
+    return dict(place=place, cfg=local_cfg, G=G, patches=patches,
+                streets=streets, nodes_points=nodes_points,
+                edges_gdf=edges_gdf, metrics=metrics)
+
+def export_city_outputs(bundle, base_out="outputs_multi"):
+    city_slug = bundle["place"].lower().replace(",", "").replace(" ", "_")
+    out_dir = os.path.join(base_out, city_slug)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # gpkg
+    out_gpkg = os.path.join(out_dir, f"{city_slug}_green_network.gpkg")
+    bundle["patches"].to_file(out_gpkg, layer="patches", driver="GPKG")
+    bundle["nodes_points"].to_file(out_gpkg, layer="nodes", driver="GPKG")
+    bundle["edges_gdf"].to_file(out_gpkg, layer="edges", driver="GPKG")
+
+    # degree histogram
+    degrees = [deg for _, deg in bundle["G"].degree()]
+    fig = plt.figure()
+    plt.hist(degrees, bins=20)
+    plt.xlabel("Node degree"); plt.ylabel("Count")
+    plt.title(f"{bundle['place']}: degree distribution")
+    save_fig(fig, os.path.join(out_dir, "degree_histogram.png"))
+
+
+  from joblib import Parallel, delayed
+PLACES = [
+    "Nashville, Tennessee, USA",
+    "Austin, Texas, USA",
+    "Charlotte, North Carolina, USA",
+    "Seattle, Washington, USA",
+]
+
+def run_one(place):
+    bundle = build_city_green_network(place)
+    export_city_outputs(bundle, base_out="outputs_multi")
+    row = {"place": place, **bundle["metrics"]}
+    # Add size/context normalizers
+    row["total_patch_area_km2"] = float(bundle["patches"].area.sum()) / 1e6
+    row["median_patch_area_m2"] = float(bundle["patches"]["area_m2"].median())
+    return row
+
+rows = Parallel(n_jobs=min(4, len(PLACES)))(delayed(run_one)(p) for p in PLACES)
+pd.DataFrame(rows).to_csv("outputs_multi/city_metrics.csv", index=False)
+print("Wrote outputs_multi/city_metrics.csv")
+
+more sources: https://onlinelibrary.wiley.com/doi/full/10.1002/gch2.202200158
+  
+
